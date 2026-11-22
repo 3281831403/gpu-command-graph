@@ -2,6 +2,7 @@
 
 Graph model
 -----------
+
 ``graph`` is a plain dict::
 
     {
@@ -31,6 +32,19 @@ Conventions
   are exact values; comparisons must not use epsilon.
 """
 
+import heapq
+
+
+def _dedupe(names):
+    """Return ``names`` as a list, duplicates removed, first-seen order kept."""
+    seen = set()
+    result = []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+    return result
+
 
 def add_pass(graph, name, reads, writes):
     """Register one pass and its resource accesses in ``graph``.
@@ -50,7 +64,95 @@ def add_pass(graph, name, reads, writes):
 
     The graph must be unchanged when registration fails.
     """
-    raise NotImplementedError
+    if not name:
+        raise ValueError("pass name must not be empty")
+    if any(existing["name"] == name for existing in graph["passes"]):
+        raise ValueError("duplicate pass: %s" % name)
+
+    read_list = _dedupe(reads)
+    write_list = _dedupe(writes)
+
+    declared = graph["resources"]
+    for resource in read_list + write_list:
+        if resource not in declared:
+            raise KeyError("undeclared resource: %s" % resource)
+
+    graph["passes"].append(
+        {"name": name, "reads": read_list, "writes": write_list}
+    )
+    return graph
+
+
+def _dependency_edges(passes):
+    """Build data-dependency edges between pass names.
+
+    Returns ``(edges, registration)`` where ``edges`` maps a pass name to the
+    set of pass names that must come after it, and ``registration`` maps each
+    pass name to its registration index (first occurrence wins).
+    """
+    registration = {}
+    for index, item in enumerate(passes):
+        registration.setdefault(item["name"], index)
+
+    edges = {name: set() for name in registration}
+
+    writers = {}
+    readers = {}
+    for item in passes:
+        name = item["name"]
+        for resource in item.get("writes", ()):
+            writers.setdefault(resource, []).append(name)
+        for resource in item.get("reads", ()):
+            readers.setdefault(resource, []).append(name)
+
+    for resource, resource_writers in writers.items():
+        # Every writer must come before every reader of the resource.
+        for reader in readers.get(resource, ()):
+            for writer in resource_writers:
+                if writer != reader:
+                    edges[writer].add(reader)
+        # Writers of the same resource keep their registration order.
+        ordered = sorted(set(resource_writers), key=registration.get)
+        for earlier, later in zip(ordered, ordered[1:]):
+            edges[earlier].add(later)
+
+    return edges, registration
+
+
+def _find_cycle(edges, nodes):
+    """Return one cycle as a list of names ``[a, b, ..., a]`` within ``nodes``.
+
+    ``nodes`` restricts the search to a subgraph (e.g. the passes Kahn's
+    algorithm could not emit).  Returns ``None`` when no cycle exists there.
+    """
+    allowed = set(nodes)
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {name: WHITE for name in allowed}
+    stack = []
+
+    def visit(node):
+        color[node] = GRAY
+        stack.append(node)
+        for nxt in sorted(edges.get(node, ())):
+            if nxt not in allowed:
+                continue
+            if color[nxt] == GRAY:
+                start = stack.index(nxt)
+                return stack[start:] + [nxt]
+            if color[nxt] == WHITE:
+                found = visit(nxt)
+                if found is not None:
+                    return found
+        stack.pop()
+        color[node] = BLACK
+        return None
+
+    for name in sorted(allowed):
+        if color[name] == WHITE:
+            found = visit(name)
+            if found is not None:
+                return found
+    return None
 
 
 def toposort(graph):
@@ -71,7 +173,40 @@ def toposort(graph):
             error must name every pass on the reported cycle, for example
             ``"cycle detected: ping -> pong -> ping"``.
     """
-    raise NotImplementedError
+    passes = graph["passes"]
+    names = [item["name"] for item in passes]
+    if len(names) != len(set(names)):
+        seen = set()
+        for name in names:
+            if name in seen:
+                raise ValueError("duplicate pass: %s" % name)
+            seen.add(name)
+
+    edges, _ = _dependency_edges(passes)
+
+    indegree = {name: 0 for name in edges}
+    for name, targets in edges.items():
+        for target in targets:
+            indegree[target] += 1
+
+    ready = [name for name, degree in indegree.items() if degree == 0]
+    heapq.heapify(ready)
+
+    order = []
+    while ready:
+        name = heapq.heappop(ready)
+        order.append(name)
+        for target in edges[name]:
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                heapq.heappush(ready, target)
+
+    if len(order) != len(edges):
+        remaining = [name for name, degree in indegree.items() if degree > 0]
+        cycle = _find_cycle(edges, remaining) or remaining
+        raise ValueError("cycle detected: %s" % " -> ".join(cycle))
+
+    return order
 
 
 def insert_barriers(order, accesses):
@@ -103,7 +238,49 @@ def insert_barriers(order, accesses):
         ValueError: ``order`` contains duplicates, has names missing from
             ``accesses``, or ``accesses`` contains names absent from ``order``.
     """
-    raise NotImplementedError
+    if len(order) != len(set(order)):
+        raise ValueError("order contains duplicate pass names")
+    missing = [name for name in order if name not in accesses]
+    if missing:
+        raise ValueError("passes missing from accesses: %s" % ", ".join(missing))
+    extra = [name for name in accesses if name not in set(order)]
+    if extra:
+        raise ValueError("accesses contain passes absent from order: %s" % ", ".join(extra))
+
+    states = {}
+    barriers = []
+    for name in order:
+        entry = accesses[name]
+        reads = set(entry.get("reads", ()))
+        writes = set(entry.get("writes", ()))
+        for resource in sorted(reads | writes):
+            if resource in reads and resource in writes:
+                new_state = "readwrite"
+            elif resource in writes:
+                new_state = "write"
+            else:
+                new_state = "read"
+
+            old_state = states.get(resource)
+            if old_state is None:
+                states[resource] = new_state
+                continue
+            if old_state == new_state and new_state in ("read", "write"):
+                continue
+            if old_state == new_state:
+                # readwrite -> readwrite: both directions already hazard.
+                states[resource] = new_state
+                continue
+            barriers.append(
+                {
+                    "before": name,
+                    "resource": resource,
+                    "from": old_state,
+                    "to": new_state,
+                }
+            )
+            states[resource] = new_state
+    return barriers
 
 
 def alias_memory(resources, pool_size):
@@ -137,7 +314,64 @@ def alias_memory(resources, pool_size):
             invalid ``pool_size``, or a layout that does not fit in the pool.
             The capacity error message mentions ``pool_size``.
     """
-    raise NotImplementedError
+    if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size <= 0:
+        raise ValueError("invalid pool_size: %r" % (pool_size,))
+
+    entries = list(resources)
+    seen = set()
+    prepared = []
+    for entry in entries:
+        name = entry["name"]
+        if not name:
+            raise ValueError("resource name must not be empty")
+        if name in seen:
+            raise ValueError("duplicate resource: %s" % name)
+        seen.add(name)
+        size = entry["size"]
+        if not isinstance(size, int) or size <= 0:
+            raise ValueError("resource %s has non-positive size: %r" % (name, size))
+        accesses = list(entry.get("reads", ())) + list(entry.get("writes", ()))
+        if not accesses:
+            raise ValueError("resource %s has no accesses" % name)
+        prepared.append(
+            {
+                "name": name,
+                "size": size,
+                "start": min(accesses),
+                "end": max(accesses),
+            }
+        )
+
+    placed = []  # dicts with name/size/start/end plus "offset"
+    result = {}
+    for item in prepared:
+        offset = 0
+        while True:
+            span_end = offset + item["size"]
+            blocker = None
+            for other in placed:
+                intervals_overlap = (
+                    item["start"] <= other["end"] and other["start"] <= item["end"]
+                )
+                if not intervals_overlap:
+                    continue
+                other_end = other["offset"] + other["size"]
+                if not (span_end <= other["offset"] or other_end <= offset):
+                    blocker = other
+                    break
+            if blocker is None:
+                break
+            offset = blocker["offset"] + blocker["size"]
+        if offset + item["size"] > pool_size:
+            raise ValueError(
+                "layout exceeds pool_size %d: resource %s needs offset %d + size %d"
+                % (pool_size, item["name"], offset, item["size"])
+            )
+        item["offset"] = offset
+        placed.append(item)
+        result[item["name"]] = {"offset": offset, "size": item["size"]}
+
+    return result
 
 
 def cull_graph(graph, used):
@@ -155,7 +389,37 @@ def cull_graph(graph, used):
     be declared resources; an unknown name raises ``KeyError`` rather than
     silently producing an empty graph.
     """
-    raise NotImplementedError
+    declared = graph["resources"]
+    needed = set()
+    for name in used:
+        if name not in declared:
+            raise KeyError("undeclared resource: %s" % name)
+        needed.add(name)
+
+    passes = graph["passes"]
+    live = set()
+    changed = True
+    while changed:
+        changed = False
+        for index, item in enumerate(passes):
+            if index in live:
+                continue
+            if any(resource in needed for resource in item.get("writes", ())):
+                live.add(index)
+                for resource in item.get("reads", ()):
+                    if resource not in needed:
+                        needed.add(resource)
+                changed = True
+
+    return {
+        "passes": [
+            {"name": item["name"], "reads": list(item.get("reads", ())),
+             "writes": list(item.get("writes", ()))}
+            for index, item in enumerate(passes)
+            if index in live
+        ],
+        "resources": dict(declared),
+    }
 
 
 def derive_state(accesses):
@@ -172,7 +436,21 @@ def derive_state(accesses):
     A read plus a write must never collapse to ``"read"``.  Return ``{}`` for
     empty input.
     """
-    raise NotImplementedError
+    read_resources = set()
+    written_resources = set()
+    for entry in accesses.values():
+        read_resources.update(entry.get("reads", ()))
+        written_resources.update(entry.get("writes", ()))
+
+    states = {}
+    for resource in read_resources | written_resources:
+        if resource in read_resources and resource in written_resources:
+            states[resource] = "readwrite"
+        elif resource in written_resources:
+            states[resource] = "write"
+        else:
+            states[resource] = "read"
+    return states
 
 
 def validate_graph(graph):
@@ -196,7 +474,46 @@ def validate_graph(graph):
     registration order.  A graph with a cycle is invalid even if every
     resource is declared and no other rule is violated.
     """
-    raise NotImplementedError
+    diagnostics = []
+    passes = graph["passes"]
+    declared = graph["resources"]
+
+    seen = set()
+    for item in passes:
+        name = item["name"]
+        if name in seen:
+            diagnostics.append("duplicate pass: %s" % name)
+        seen.add(name)
+
+    for item in passes:
+        name = item["name"]
+        for resource in item.get("reads", ()):
+            if resource not in declared:
+                diagnostics.append(
+                    "undeclared resource: %s (pass %s)" % (resource, name)
+                )
+            elif declared[resource].get("access", "readwrite") == "write":
+                diagnostics.append(
+                    "read/write conflict: pass %s reads %s declared write"
+                    % (name, resource)
+                )
+        for resource in item.get("writes", ()):
+            if resource not in declared:
+                diagnostics.append(
+                    "undeclared resource: %s (pass %s)" % (resource, name)
+                )
+            elif declared[resource].get("access", "readwrite") == "read":
+                diagnostics.append(
+                    "read/write conflict: pass %s writes %s declared read"
+                    % (name, resource)
+                )
+
+    edges, _ = _dependency_edges(passes)
+    cycle = _find_cycle(edges, edges.keys())
+    if cycle is not None:
+        diagnostics.append("cycle detected: %s" % " -> ".join(cycle))
+
+    return sorted(diagnostics)
 
 
 def compile_batch(graphs, config):
@@ -225,4 +542,62 @@ def compile_batch(graphs, config):
 
     Returns ``{batch_key: compiled_result}``.
     """
-    raise NotImplementedError
+    pool_size = config.get("pool_size")
+    if isinstance(pool_size, bool) or not isinstance(pool_size, int) or pool_size <= 0:
+        raise ValueError("config must contain a positive integer pool_size")
+
+    results = {}
+    for key, graph in graphs.items():
+        errors = validate_graph(graph)
+        if errors:
+            results[key] = {
+                "order": [],
+                "barriers": [],
+                "aliases": {},
+                "errors": list(errors),
+            }
+            continue
+
+        order = toposort(graph)
+        accesses = {
+            item["name"]: {
+                "reads": list(item.get("reads", ())),
+                "writes": list(item.get("writes", ())),
+            }
+            for item in graph["passes"]
+        }
+        barriers = insert_barriers(order, accesses)
+
+        position = {name: index for index, name in enumerate(order)}
+        usage = {}
+        for item in graph["passes"]:
+            index = position[item["name"]]
+            for resource in item.get("reads", ()):
+                usage.setdefault(resource, {"reads": [], "writes": []})["reads"].append(index)
+            for resource in item.get("writes", ()):
+                usage.setdefault(resource, {"reads": [], "writes": []})["writes"].append(index)
+
+        alias_input = [
+            {
+                "name": name,
+                "size": graph["resources"][name]["size"],
+                "reads": sorted(access["reads"]),
+                "writes": sorted(access["writes"]),
+            }
+            for name, access in usage.items()
+        ]
+
+        aliases = {}
+        try:
+            aliases = alias_memory(alias_input, pool_size)
+        except ValueError as exc:
+            errors = [str(exc)]
+
+        results[key] = {
+            "order": order,
+            "barriers": barriers,
+            "aliases": aliases,
+            "errors": errors,
+        }
+
+    return results
